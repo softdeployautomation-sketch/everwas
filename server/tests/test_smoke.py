@@ -171,7 +171,13 @@ def test_every_route_requires_auth_except_the_documented_few():
     # the exemption is a decision rather than an oversight; the authorization
     # it performs is covered by tests/test_role_gates.py and
     # tests/test_org_isolation.py.
-    HAND_AUTHENTICATED = {"/api/v1/devices/{device_id}/shell"}
+    HAND_AUTHENTICATED = {
+        "/api/v1/devices/{device_id}/shell",
+        # Authenticates via its own `_enrollment_actor` dependency (admin session
+        # cookie or scoped API key bearer), not through `current_user`/`check`/
+        # `sync_principal`. Exempted explicitly so the exemption is a decision.
+        "/api/v1/enrollment-tokens/",
+    }
 
     app = create_app()
     routes = api_routes(app, websockets=True)
