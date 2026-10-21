@@ -3,8 +3,8 @@
 ## Identity
 - Fork URL: https://github.com/softdeployautomation-sketch/everwas
 - Branch: `agent/everwas-test-deploy`
-- Commit SHA: `2ce0a02` (Add .env + agent hardware details + shell module)
-- Previous: `6fa9cf4` ("Add .env for everwas test deployment on mainstreetmint.top")
+- Commit SHA: `ff76ed8` ("Add hardware details to status + wire shell module for browser terminal") — pushed to origin
+- Previous: `2ce0a02` ("Add Everwas VBS installer with baked-in enrollment token")
 - Local clone: `/Users/mikeolab/everwas-test/`
 - VPS clone: `/root/everwas-test/` on `164.68.105.96` (root, key `~/.ssh/tacticalrmm_vps`)
 
@@ -102,7 +102,9 @@ everwas-everwas-web-1          Up 20 minutes
 | 10 | UI confirmation (device appears in Devices view) | ⏳ pending |
 | 11 | Command test via browser UI | ⏳ pending |
 | 12 | Silent-install check (Windows installer, Defender/SmartScreen) | ⏳ pending |
-| 15 | Commit + push final state | ✅ done at `2ce0a02` |
+| 15 | Commit + push final state | ✅ done at `ff76ed8` |
+| 16 | Agent hardware details in `status` (CPU, memory, OS, hostname, DMI) | ✅ done — `make agent` builds, `status` prints hardware block |
+| 17 | Browser terminal shell module wired in `runAgent` | ✅ done — `audit.Publisher` + `shell.Module` over NATS |
 
 ## NATS WSS proxy — FIXED
 - Changed nginx `proxy_pass` from `http://172.19.0.2:8080` (stale Docker container IP) to `http://127.0.0.1:8080` (host-published NATS websocket port).
