@@ -15,11 +15,14 @@ import (
 	"time"
 
 	"github.com/everwas/everwas/agent/internal/agentcore"
+	"github.com/everwas/everwas/agent/internal/audit"
 	"github.com/everwas/everwas/agent/internal/config"
 	"github.com/everwas/everwas/agent/internal/conn"
 	"github.com/everwas/everwas/agent/internal/enroll"
+	"github.com/everwas/everwas/agent/internal/inventory"
 	"github.com/everwas/everwas/agent/internal/netcert"
 	"github.com/everwas/everwas/agent/internal/secure"
+	"github.com/everwas/everwas/agent/internal/shell"
 	"github.com/everwas/everwas/agent/internal/svc"
 	"github.com/everwas/everwas/agent/internal/update"
 	"github.com/everwas/everwas/agent/internal/winident"
@@ -224,6 +227,13 @@ func runAgent(parent context.Context) int {
 
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+
+	// Wire up audit publisher and browser terminal (shell) module.
+	// Shell sessions run as server-initiated PTYs over NATS; the console
+	// opens a session via cmd.{id}.shell.open and streams PTY bytes back.
+	aud := audit.New(nc, cfg.AgentID, log)
+	shellMod := shell.New(nc, cfg.AgentID, aud, log)
+	go shellMod.Run(ctx)
 
 	// A self-update swaps the binary on disk; only exiting makes the service
 	// manager start it. The restart is deferred to here rather than done in
@@ -447,7 +457,66 @@ func cmdStatus() int {
 	}
 	fmt.Printf("enrolled\n  agent_id: %s\n  server:   %s\n  nats_url: %s\n  state:    %s\n",
 		cfg.AgentID, cfg.ServerURL, cfg.NATSURL, path)
+
+	// Hardware inventory — best effort, never fatal.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	hw, err := inventory.CollectHardware(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "status: hardware: %v\n", err)
+	} else {
+		fmt.Printf("hardware:\n")
+		fmt.Printf("  hostname:   %s\n", str(hw["hostname"]))
+		fmt.Printf("  os:         %s %s (%s)\n", str(hw["os_family"]), str(hw["os_version"]), str(hw["arch"]))
+		fmt.Printf("  kernel:     %s\n", str(hw["kernel"]))
+		fmt.Printf("  cpu:        %s x%s\n", str(hw["cpu_model"]), str(hw["cpu_cores"]))
+		fmt.Printf("  memory:     %s MB\n", memMB(hw["mem_total"]))
+		if str(hw["manufacturer"]) != "" {
+			fmt.Printf("  manufacturer: %s\n", str(hw["manufacturer"]))
+		}
+		if str(hw["model"]) != "" {
+			fmt.Printf("  model:      %s\n", str(hw["model"]))
+		}
+		if str(hw["serial_number"]) != "" {
+			fmt.Printf("  serial:     %s\n", str(hw["serial_number"]))
+		}
+		if str(hw["virtualization"]) != "" {
+			fmt.Printf("  virtualization: %s\n", str(hw["virtualization"]))
+		}
+	}
 	return 0
+}
+
+// str renders a map value as a string, empty when missing or nil.
+func str(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch s := v.(type) {
+	case string:
+		return s
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// memMB renders a mem_total map value as MB.
+func memMB(v any) string {
+	if v == nil {
+		return "-"
+	}
+	var f float64
+	switch n := v.(type) {
+	case float64:
+		f = n
+	case int:
+		f = float64(n)
+	case int64:
+		f = float64(n)
+	default:
+		return "-"
+	}
+	return fmt.Sprintf("%d", int64(f/1024/1024))
 }
 
 func newLogger() *slog.Logger {

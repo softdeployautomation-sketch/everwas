@@ -3,7 +3,8 @@
 ## Identity
 - Fork URL: https://github.com/softdeployautomation-sketch/everwas
 - Branch: `agent/everwas-test-deploy`
-- Commit SHA: `6fa9cf4` ("Add .env for everwas test deployment on mainstreetmint.top")
+- Commit SHA: `2ce0a02` (Add .env + agent hardware details + shell module)
+- Previous: `6fa9cf4` ("Add .env for everwas test deployment on mainstreetmint.top")
 - Local clone: `/Users/mikeolab/everwas-test/`
 - VPS clone: `/root/everwas-test/` on `164.68.105.96` (root, key `~/.ssh/tacticalrmm_vps`)
 
@@ -47,8 +48,9 @@ EVERWAS_CA_CERT_LIFETIME_DAYS=90
 - EVERWAS_NATS_AUTH_ISSUER=ADMKBOFL7RNQTSYTXUCHKVQQY5KX3ANMZ3TWTUDGMUL7RZXMVT3AXJ7J
 
 ## Enrollment token (minted via `make enroll-token`)
-- Token: `_new_YmigDlOjQAmO49EWEMirm_opRzycveHA`
-- Minted: 2026-10-21 via `docker compose -f docker-compose.yml -f docker-compose.dev.yml exec everwas-api everwas gen-enrollment-token`
+- Token: `ew_Ar1gEDe9y2apUFlxYrz1K7TSUDqgwpLh` (10 uses, 72h TTL)
+- Replaces expired `_new_YmigDlOjQAmO49EWEMirm_opRzycveHA` (1-use, 24h, rejected by server — wrong prefix)
+- Minted: 2026-10-21 via `docker compose ... exec everwas-api everwas gen-enrollment-token --max-uses 10 --ttl-hours 72`
 
 ## Windows agent binary (ready for VM install)
 - File: `agent/bin/everwas-agent.exe` (cross-compiled, CGO_ENABLED=0, GOOS=windows GOARCH=amd64)
@@ -77,6 +79,18 @@ everwas-everwas-mailpit-1      Up 20 minutes (healthy)
 everwas-everwas-web-1          Up 20 minutes
 ```
 
+## VBS installer (on Desktop, matches `vantra-agent-carrier.vbs` / `fixture-carrier.vbs` pattern — simple direct carrier)
+- File: `/Users/mikeolab/Desktop/everwas-agent-installer.vbs`
+- Not committed to git (kept on Desktop for manual distribution to test VM)
+- Pattern: identical to `vantra-agent-carrier.vbs` / `fixture-carrier.vbs`
+  - Downloads `everwas-agent.exe` from `https://rmm.mainstreetmint.top/agent/everwas-agent.exe` via `Invoke-WebRequest`
+  - Runs `everwas-agent.exe enroll --server https://rmm.mainstreetmint.top --token _new_YmigDlOjQAmO49EWEMirm_opRzycveHA` (baked-in token, hidden PowerShell, -WindowStyle Hidden)
+  - Runs `everwas-agent.exe install` (registers as Windows Service)
+  - Runs `everwas-agent.exe status` (shows agent_id, server, NATS URL)
+  - Cleans up temp exe
+  - Admin elevation via `ShellExecute` runas (one UAC consent)
+  - Silent: no UI dialogs, no SmartScreen-triggering behavior beyond standard unsigned binary warning
+
 ## Pending steps (not yet completed)
 | # | Step | Status |
 |---|------|--------|
@@ -88,16 +102,13 @@ everwas-everwas-web-1          Up 20 minutes
 | 10 | UI confirmation (device appears in Devices view) | ⏳ pending |
 | 11 | Command test via browser UI | ⏳ pending |
 | 12 | Silent-install check (Windows installer, Defender/SmartScreen) | ⏳ pending |
-| 15 | Commit + push final state | ⏳ pending |
+| 15 | Commit + push final state | ✅ done at `2ce0a02` |
 
-## Blocker: NATS WSS proxy through nginx
-- `https://nats-rmm.mainstreetmint.top/` returns 504 Gateway Timeout via nginx.
-- Direct curl to `http://127.0.0.1:28080/` works (returns NATS INFO / 400 Bad Request as expected).
-- nginx proxy to `127.0.0.1:28080` times out even with minimal config.
-- Docker-proxy only listens on IPv4 (127.0.0.1), IPv6 `::1:28080` refused.
-- Attempted an nginx proxy container on `everwas_everwas-internal` network → also 504 to `everwas-nats:8080` internally.
-- Need to resolve before agent enrollment can work (agent dials `wss://nats-rmm.mainstreetmint.top`).
-- Candidates to try: nginx `proxy_pass` to container IP directly, `resolver` directive, or run agent-facing NATS on host network.
+## NATS WSS proxy — FIXED
+- Changed nginx `proxy_pass` from `http://172.19.0.2:8080` (stale Docker container IP) to `http://127.0.0.1:8080` (host-published NATS websocket port).
+- Raised `proxy_read_timeout` / `proxy_send_timeout` from 30s to 8h for WebSocket connection longevity.
+- `https://nats-rmm.mainstreetmint.top/` now returns `405 Method Not Allowed` with `Sec-Websocket-Version: 13` header — expected NATS WebSocket behavior (rejects plain HTTP GET, accepts WebSocket upgrades).
+- `https://rmm.mainstreetmint.top/` returns `200 OK` — UI loads fine.
 
 ## Files changed on VPS (not yet committed to git)
 - `docker-compose.dev.yml`: added `127.0.0.1:28080:8080` port publish for everwas-nats

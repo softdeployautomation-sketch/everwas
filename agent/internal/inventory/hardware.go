@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/shirou/gopsutil/v4/cpu"
@@ -29,6 +30,24 @@ type hardware struct {
 	Model        string `json:"model,omitempty"`
 	SerialNumber string `json:"serial_number,omitempty"`
 	ChassisType  string `json:"chassis_type,omitempty"`
+}
+
+// CollectHardware is an exported wrapper around collectHardware so that
+// cmdStatus can report hardware details without the full inventory loop.
+func CollectHardware(ctx context.Context) (map[string]any, error) {
+	hw, err := collectHardware(ctx)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(hw)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func collectHardware(ctx context.Context) (any, error) {
