@@ -11,6 +11,7 @@ from everwas.api.v1 import (
     audit,
     auth,
     devices,
+    enrollment_tokens,
     health,
     packages,
     patches,
@@ -49,6 +50,11 @@ def create_app() -> FastAPI:
     app.include_router(audit.router, prefix="/api/v1/audit", tags=["audit"])
     app.include_router(admin.router, prefix="/api/v1/admin", tags=["admin"])
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+    app.include_router(
+        enrollment_tokens.router,
+        prefix="/api/v1/enrollment-tokens",
+        tags=["enrollment-tokens"],
+    )
     app.include_router(agents.router, prefix="/api/v1/agents", tags=["agents"])
     app.include_router(devices.router, prefix="/api/v1/devices", tags=["devices"])
     app.include_router(scripts.router, prefix="/api/v1/scripts", tags=["scripts"])

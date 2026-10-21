@@ -43,6 +43,7 @@ KNOWN_SCOPES = frozenset(
         "scripts:read",
         "scripts:run",
         "audit:read",
+        "enrollment-tokens:write",
     }
 )
 

@@ -27,4 +27,5 @@ class EnrollmentTokenOut(BaseModel):
     token: str  # shown exactly once, at creation
     site_id: uuid.UUID | None
     max_uses: int
+    ttl_hours: int | None = None
     expires_at: datetime | None
