@@ -6,6 +6,7 @@ package shell
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -154,12 +155,74 @@ func (m *Module) Count() int {
 	return len(m.sessions)
 }
 
-// Run blocks until ctx is cancelled, then closes every session. It is the
-// supervisor task entry point.
+// Run subscribes to command subjects, blocks until ctx is cancelled, then
+// closes every session. It is the supervisor task entry point.
 func (m *Module) Run(ctx context.Context) error {
+	openSub, err := m.nc.Subscribe(wire.Cmd(m.agentID, "shell.open"), m.handleOpen)
+	if err != nil {
+		return fmt.Errorf("subscribe shell.open: %w", err)
+	}
+	closeSub, err := m.nc.Subscribe(wire.Cmd(m.agentID, "shell.close"), m.handleClose)
+	if err != nil {
+		openSub.Unsubscribe()
+		return fmt.Errorf("subscribe shell.close: %w", err)
+	}
+
 	<-ctx.Done()
+	openSub.Unsubscribe()
+	closeSub.Unsubscribe()
 	m.shutdown()
 	return ctx.Err()
+}
+
+// handleOpen answers cmd.{agent_id}.shell.open. It decodes the OpenSpec,
+// starts the session, and replies {\"accepted\": true, \"session_id\": ...}
+// or {\"accepted\": false, \"error\": ...} on msg.Reply.
+func (m *Module) handleOpen(msg *nats.Msg) {
+	var spec OpenSpec
+	if err := json.Unmarshal(msg.Data, &spec); err != nil {
+		m.respond(msg.Reply, map[string]any{"accepted": false, "error": "bad request: " + err.Error()})
+		return
+	}
+	if err := m.OpenSession(spec); err != nil {
+		m.respond(msg.Reply, map[string]any{"accepted": false, "error": err.Error()})
+		return
+	}
+	m.respond(msg.Reply, map[string]any{"accepted": true, "session_id": spec.SessionID})
+	m.log.Info("shell session accepted", "session_id", spec.SessionID, "requested_by", spec.RequestedBy)
+}
+
+// handleClose answers cmd.{agent_id}.shell.close. It tears down the named
+// session and replies {\"accepted\": true} or {\"accepted\": false, \"error\": ...}.
+func (m *Module) handleClose(msg *nats.Msg) {
+	var req struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		m.respond(msg.Reply, map[string]any{"accepted": false, "error": "bad request: " + err.Error()})
+		return
+	}
+	if err := m.Close(req.SessionID); err != nil {
+		m.respond(msg.Reply, map[string]any{"accepted": false, "error": err.Error()})
+		return
+	}
+	m.respond(msg.Reply, map[string]any{"accepted": true})
+	m.log.Info("shell session closed on request", "session_id", req.SessionID)
+}
+
+// respond publishes a JSON payload to msg.Reply when one is set.
+func (m *Module) respond(reply string, payload map[string]any) {
+	if reply == "" {
+		return
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		m.log.Warn("shell reply marshal", "err", err)
+		return
+	}
+	if err := m.nc.Publish(reply, raw); err != nil {
+		m.log.Warn("shell reply publish", "err", err)
+	}
 }
 
 func (m *Module) shutdown() {
