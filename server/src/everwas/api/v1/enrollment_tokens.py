@@ -10,6 +10,7 @@ Returns: `{ token, max_uses, ttl_hours, expires_at }`.
 """
 
 import hashlib
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, status
@@ -19,10 +20,10 @@ from sqlalchemy import select
 from everwas.api.deps import DbSession
 from everwas.models.device import EnrollmentToken
 from everwas.models.user import Role
+from everwas.schemas.enrollment import EnrollmentTokenOut
 from everwas.security.api_keys import KEY_PREFIX, authenticate_key
 from everwas.security.sessions import SESSION_COOKIE, resolve_session
 from everwas.services.enrollment import mint_enrollment_token
-from everwas.schemas.enrollment import EnrollmentTokenOut
 
 router = APIRouter()
 
@@ -32,6 +33,7 @@ class EnrollmentTokenIn(BaseModel):
 
     max_uses: int | None = None
     ttl_hours: int | None = None
+    site_id: str | None = None
 
     def resolved(self) -> tuple[int, int]:
         return (
@@ -61,7 +63,7 @@ async def _enrollment_actor(
 
     # Path 2: API key Bearer (`ewpk_...`) with the `enrollment-tokens:write` scope.
     if authorization and authorization.lower().startswith("bearer "):
-        raw_key = authorization[len("bearer "):].strip()
+        raw_key = authorization[len("bearer ") :].strip()
         if raw_key.startswith(KEY_PREFIX):
             principal = await authenticate_key(db, raw_key)
             if principal is None:
@@ -98,8 +100,13 @@ async def create_enrollment_token(
     actor: Annotated[str, Depends(_enrollment_actor)],
 ) -> EnrollmentTokenOut:
     """Mint a long-lived enrollment token for public device onboarding."""
+    site_uuid = None
+    if body.site_id:
+        site_uuid = uuid.UUID(body.site_id)
+
     _row, token = await mint_enrollment_token(
         db,
+        site_id=site_uuid,
         max_uses=body.resolved()[0],
         ttl_hours=body.resolved()[1],
         created_by=actor,
@@ -110,9 +117,7 @@ async def create_enrollment_token(
     row = (
         await db.execute(
             select(EnrollmentToken).where(
-                EnrollmentToken.token_hash == hashlib.sha256(
-                    token.encode()
-                ).hexdigest()
+                EnrollmentToken.token_hash == hashlib.sha256(token.encode()).hexdigest()
             )
         )
     ).scalar_one()

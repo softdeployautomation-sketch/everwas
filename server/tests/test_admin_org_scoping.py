@@ -19,6 +19,7 @@ import uuid
 import pytest
 
 from everwas.db.engine import session_scope
+from everwas.models.device import Site
 from everwas.models.org import DEFAULT_ORG_ID, Organization
 from everwas.models.user import Role, User
 
@@ -97,3 +98,46 @@ async def test_the_default_org_is_not_a_dumping_ground():
             db, name=f"s-{uuid.uuid4().hex[:6]}", actor="a@b.example.com", actor_org=org_b
         )
     assert site.org_id != DEFAULT_ORG_ID
+
+
+async def test_rename_site_is_scoped_to_the_creating_admins_org():
+    from everwas.services.admin import AdminError, create_site, rename_site
+
+    org_a = DEFAULT_ORG_ID
+    org_b = await _org_b()
+
+    async with session_scope() as db:
+        site = await create_site(
+            db, name=f"site-a-{uuid.uuid4().hex[:6]}", actor="admin@a.example.com", actor_org=org_a
+        )
+        site_id = site.id
+
+    async with session_scope() as db:
+        with pytest.raises(AdminError, match="unknown site"):
+            await rename_site(
+                db,
+                site_id,
+                name=f"stolen-{uuid.uuid4().hex[:6]}",
+                actor="admin@b.example.com",
+                actor_org=org_b,
+            )
+
+
+async def test_delete_site_is_scoped_to_the_creating_admins_org():
+    from everwas.services.admin import AdminError, create_site, delete_site
+
+    org_a = DEFAULT_ORG_ID
+    org_b = await _org_b()
+
+    async with session_scope() as db:
+        site = await create_site(
+            db, name=f"site-a-{uuid.uuid4().hex[:6]}", actor="admin@a.example.com", actor_org=org_a
+        )
+        site_id = site.id
+
+    async with session_scope() as db:
+        with pytest.raises(AdminError, match="unknown site"):
+            await delete_site(db, site_id, actor="admin@b.example.com", actor_org=org_b)
+
+    async with session_scope() as db:
+        assert await db.get(Site, site_id) is not None

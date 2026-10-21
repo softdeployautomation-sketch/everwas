@@ -191,9 +191,15 @@ def test_every_route_requires_auth_except_the_documented_few():
             continue
         names = {d.name for d in route.dependant.dependencies}
         flat = str(route.dependant.dependencies) + str(names)
-        # sync_principal is the deliberate second authentication root: the
-        # /api/v1/sync surface takes bearer tokens, never the session cookie.
-        if "current_user" not in flat and "check" not in flat and "sync_principal" not in flat:
+        # _admin_actor is the deliberate authentication root for the admin
+        # surfaces (users, api-keys, sites): session cookie or scoped API key
+        # bearer, resolved independently of `current_user`.
+        if (
+            "current_user" not in flat
+            and "check" not in flat
+            and "sync_principal" not in flat
+            and "_admin_actor" not in flat
+        ):
             unguarded.append(f"{sorted(getattr(route, 'methods', []) or ['WS'])} {route.path}")
 
     assert not unguarded, f"routes without authentication: {unguarded}"

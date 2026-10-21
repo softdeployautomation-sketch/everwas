@@ -44,6 +44,8 @@ KNOWN_SCOPES = frozenset(
         "scripts:run",
         "audit:read",
         "enrollment-tokens:write",
+        "sites:read",
+        "sites:write",
     }
 )
 
@@ -265,7 +267,9 @@ async def rename_site(
     description/address follow the schema's convention: None leaves the
     stored value alone, an explicit empty string clears it.
     """
-    site = await db.get(Site, site_id)
+    site = (
+        await db.execute(select(Site).where(Site.id == site_id, Site.org_id == actor_org))
+    ).scalar_one_or_none()
     if site is None:
         raise AdminError("unknown site")
     clash = (
