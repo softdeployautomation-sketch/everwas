@@ -16,6 +16,8 @@ services:
 
   everwas-nats:
     image: nats:2.12-alpine
+    ports:
+      - "8080:8080"
     command: ["-c", "/etc/nats/nats.conf"]
     environment:
       EVERWAS_NATS_AUTH_ISSUER: ${EVERWAS_NATS_AUTH_ISSUER:?run `everwas gen-nats-keys`}
