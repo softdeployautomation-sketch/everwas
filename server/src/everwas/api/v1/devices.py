@@ -1,25 +1,33 @@
+import asyncio
+import hashlib
 import json
+import time
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Annotated, Literal
 
 import nats.errors
 import structlog
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from everwas.api.deps import CurrentUser, DbSession, require_role
 from everwas.bitemporal.query import get_facts
 from everwas.config import get_settings
+from everwas.db.engine import session_scope
+from everwas.models.audit import ActorType, AuditLog
 from everwas.models.device import Device, DeviceStatus
 from everwas.models.facts import FactKind, FactNetwork
+from everwas.models.job_outbox import KIND_SCRIPT_RUN, JobOutbox, JobOutboxStatus
 from everwas.models.org import Organization
 from everwas.models.script import RunStatus, RunTrigger, ScriptRun
 from everwas.models.telemetry import DeviceSnapshot, DeviceStatusLatest, telemetry_metrics
 from everwas.models.user import Role
 from everwas.natsio.agent_request import request_agent
 from everwas.natsio.client import get_nats
+from everwas.natsio.subjects import jobs_queue
 from everwas.schemas.device import (
     AgentUpdateRequest,
     DeviceDetailOut,
@@ -29,6 +37,8 @@ from everwas.schemas.device import (
     NetRatePoint,
     TelemetryPoint,
 )
+from everwas.security.api_keys import KEY_PREFIX, authenticate_key
+from everwas.security.sessions import SESSION_COOKIE, resolve_session
 from everwas.security.tenancy import caller_org, scope_to_org
 from everwas.services.certificates import certificate_drift
 from everwas.services.devices import DeviceNotRetiredError, delete_device
@@ -550,3 +560,215 @@ async def update_agent(
     await db.commit()
     log.info("agent update dispatched", device_id=str(device_id), version=body.version)
     return {"job_id": str(run.id), "accepted": True, "version": body.version}
+
+
+# ---------------------------------------------------------------- ad-hoc command
+#
+# 2026-10-22 — SpaceWorker's "Run now" needs a one-shot command with the
+# output, and Everwas had no such surface: the only exec path was the
+# interactive shell WebSocket, which authenticates with a browser session
+# cookie and is therefore unusable for a service-to-service call.
+#
+# This route queues an ordinary `script.run` job for exactly one device (the
+# same wire path the Scripts screen uses — script_runs + job_outbox in one
+# transaction, the dispatcher publishes after commit) and then waits for the
+# result ingest to fill the run row. Nothing new runs on the agent, and an
+# ad-hoc command is visible in the same run history as a saved script.
+#
+# Auth mirrors admin.py/enrollment_tokens.py: an operator/admin session cookie
+# OR an API key bearer (`ewpk_...`) holding `scripts:run`. The key's org is the
+# tenant boundary; a session caller is scoped by its own org.
+
+TERMINAL_RUN_STATUSES = frozenset(
+    {RunStatus.succeeded, RunStatus.failed, RunStatus.timeout, RunStatus.cancelled}
+)
+
+
+@dataclass(frozen=True)
+class CommandActor:
+    email: str
+    org_id: uuid.UUID | None
+    scopes: frozenset[str] = frozenset()
+    is_session: bool = False
+
+    def requires(self, scope: str) -> None:
+        if not self.is_session and scope not in self.scopes:
+            held = ", ".join(sorted(self.scopes)) or "none"
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"This token lacks the '{scope}' scope. Scopes on this token: {held}.",
+            )
+
+
+async def _command_actor(
+    db: DbSession,
+    everwas_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> CommandActor:
+    """Operator/admin session OR API key bearing `scripts:run`."""
+    if everwas_session:
+        user = await resolve_session(db, everwas_session)
+        if user is None or not user.is_active:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session expired")
+        if user.role not in (Role.admin, Role.operator):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient role")
+        return CommandActor(email=user.email, org_id=user.org_id, is_session=True)
+
+    if authorization and authorization.lower().startswith("bearer "):
+        raw_key = authorization[len("bearer ") :].strip()
+        if raw_key.startswith(KEY_PREFIX):
+            principal = await authenticate_key(db, raw_key)
+            if principal is None:
+                raise HTTPException(
+                    status.HTTP_401_UNAUTHORIZED,
+                    "Invalid or expired API key.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return CommandActor(
+                email=principal.name,
+                org_id=principal.org_id,
+                scopes=frozenset(principal.scopes),
+            )
+
+    raise HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        "Not authenticated. Present an operator session cookie or an API key: "
+        "Authorization: Bearer ewpk_...",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+class CommandIn(BaseModel):
+    command: str
+    shell: Literal["powershell", "cmd"] = "powershell"
+    timeout_s: int = 90
+
+
+class CommandOut(BaseModel):
+    ok: bool
+    status: str
+    exit_code: int | None = None
+    output: str = ""
+    truncated: bool = False
+    run_id: str
+    duration_ms: int = 0
+
+
+@router.post("/{device_id}/command")
+async def run_device_command(
+    device_id: uuid.UUID,
+    body: CommandIn,
+    db: DbSession,
+    actor: CommandActor = Depends(_command_actor),
+) -> CommandOut:
+    """Run one command on one device and wait for its output.
+
+    This is the service-to-service exec surface (SpaceWorker "Run now"). Saved
+    scripts and schedules go through the Scripts API; both land on the same
+    `script.run` job, so what a caller sees here is the run history they can
+    audit later.
+    """
+    actor.requires("scripts:run")
+    command = body.command.strip()
+    if not command:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "command is required")
+    if len(command) > 8000:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "command is too long (max 8000)")
+    if not 1 <= body.timeout_s <= 300:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "timeout_s must be 1..300")
+
+    device = (
+        await db.execute(
+            scope_to_org(select(Device).where(Device.id == device_id), Device.org_id, actor.org_id)
+        )
+    ).scalar_one_or_none()
+    if device is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown device")
+    if device.status is DeviceStatus.retired:
+        raise HTTPException(status.HTTP_409_CONFLICT, "device is retired")
+    # A queued job would run WHENEVER the agent reconnects — hours later, with
+    # nobody watching. "Run now" must mean now: refuse an agent we know is not
+    # connected instead of surprising someone with a root shell on a laptop
+    # they opened a day later.
+    if device.status is not DeviceStatus.active:
+        raise HTTPException(status.HTTP_409_CONFLICT, "device is offline")
+
+    run_id = uuid.uuid4()
+    started = time.monotonic()
+    run = ScriptRun(
+        id=run_id,
+        script_id=None,
+        device_id=device.id,
+        trigger=RunTrigger.manual,
+        status=RunStatus.queued,
+        requested_by=actor.email,
+    )
+    db.add(run)
+    db.add(
+        JobOutbox(
+            id=run_id,
+            device_id=device.id,
+            subject=jobs_queue(str(device.id)),
+            kind=KIND_SCRIPT_RUN,
+            payload={
+                "shell": body.shell,
+                "body": command,
+                "timeout_s": body.timeout_s,
+                # Same field shape a saved script sends. A digest keeps the
+                # agent's tamper check meaningful for an ad-hoc body too.
+                "sha256": hashlib.sha256(command.encode()).hexdigest(),
+                "requested_by": actor.email,
+                "env": {},
+            },
+        )
+    )
+    db.add(
+        AuditLog(
+            org_id=device.org_id,
+            actor_type=ActorType.api_key if not actor.is_session else ActorType.user,
+            actor_id=actor.email,
+            action="device.command",
+            target_type="device",
+            target_id=str(device.id),
+            detail={"run_id": str(run_id), "shell": body.shell},
+        )
+    )
+    await db.commit()
+
+    # Result ingest (dispatcher) writes stdout/stderr and the terminal status.
+    # Poll the run row; a 0.25 s cadence is well below the 90 s command ceiling.
+    deadline = started + body.timeout_s + 12
+    row: ScriptRun | None = None
+    while time.monotonic() < deadline:
+        async with session_scope() as poll:
+            row = await poll.get(ScriptRun, run_id)
+        if row is not None and row.status in TERMINAL_RUN_STATUSES:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            output = (row.stdout or "") + (row.stderr or "")
+            return CommandOut(
+                ok=row.status == RunStatus.succeeded,
+                status=row.status.value if hasattr(row.status, "value") else str(row.status),
+                exit_code=row.exit_code,
+                output=output,
+                truncated=bool(row.truncated),
+                run_id=str(run_id),
+                duration_ms=duration_ms,
+            )
+        await asyncio.sleep(0.25)
+
+    # No answer. Close the books rather than leave a queued job that would run
+    # unattended later: cancel the run and drop the outbox row if the drainer
+    # has not published it yet. (If it did publish, the agent may still run it;
+    # the run row is already terminal so the output is never attributed to a
+    # caller that gave up. Refusing offline devices above is what keeps this
+    # rare.)
+    async with session_scope() as close_db:
+        row = await close_db.get(ScriptRun, run_id)
+        if row is not None and row.status not in TERMINAL_RUN_STATUSES:
+            row.status = RunStatus.timeout
+            row.stderr = "the agent did not answer before the timeout"
+            row.finished_at = datetime.now(UTC)
+        outbox = await close_db.get(JobOutbox, run_id)
+        if outbox is not None and outbox.status is JobOutboxStatus.pending:
+            outbox.status = JobOutboxStatus.cancelled
+    raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, "device did not answer in time")

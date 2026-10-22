@@ -17,6 +17,10 @@ class DeviceOut(BaseModel):
     tags: list[str]
     last_heartbeat_at: datetime | None
     enrolled_at: datetime
+    # Additive (2026-10-22): the site the device belongs to, so a
+    # service-to-service caller can verify its tenant mapping without a
+    # second read. Nullable because pre-site devices exist.
+    site_id: uuid.UUID | None = None
 
     model_config = {"from_attributes": True}
 
