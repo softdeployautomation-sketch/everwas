@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Link, useParams } from "react-router-dom"
-import { ArrowLeft, Cpu, HardDrive, History, MemoryStick, Monitor, Wifi } from "lucide-react"
+import { Link, useNavigate, useParams } from "react-router-dom"
+import {
+  ArrowLeft,
+  Cpu,
+  HardDrive,
+  History,
+  MemoryStick,
+  Monitor,
+  Trash2,
+  TriangleAlert,
+  Wifi,
+} from "lucide-react"
 
 import {
   api,
@@ -12,6 +22,7 @@ import {
   type SnapshotKind,
   type NetInterfaceSeries,
   type TelemetryPoint,
+  type User,
 } from "@/lib/api"
 import { SessionPlayer } from "@/components/SessionPlayer"
 import { DeviceTerminal } from "@/components/Terminal"
@@ -308,6 +319,7 @@ function SnapshotTable({ kind, rows }: { kind: SnapshotKind; rows: Record<string
 
 export function DeviceDetailPage() {
   const { id } = useParams<{ id: string }>()
+  const navigate = useNavigate()
   const [device, setDevice] = useState<DeviceDetail | null>(null)
   const [telemetry, setTelemetry] = useState<TelemetryPoint[]>([])
   const [tab, setTab] = useState<Tab>("software")
@@ -317,6 +329,14 @@ export function DeviceDetailPage() {
   const [nets, setNets] = useState<NetInterfaceSeries[]>([])
   const [sessions, setSessions] = useState<ShellSessionRow[]>([])
   const [playing, setPlaying] = useState<string | null>(null)
+
+  // Retire and delete are admin-only on the server; hide them for anyone else
+  // rather than letting the refusal be the first thing they learn.
+  const [me, setMe] = useState<User | null>(null)
+  const [confirming, setConfirming] = useState<"retire" | "delete" | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
 
   // time machine: hoursBack = 0 means "now"
   const [timeMachine, setTimeMachine] = useState(false)
@@ -332,6 +352,44 @@ export function DeviceDetailPage() {
     api.telemetry(id).then(setTelemetry).catch(() => {})
     api.network(id).then(setNets).catch(() => {})
   }, [id])
+
+  useEffect(() => {
+    api.me().then(setMe).catch(() => {})
+  }, [])
+
+  const loadDevice = useCallback(() => {
+    if (!id) return
+    api.device(id).then(setDevice).catch(() => {})
+  }, [id])
+
+  const retire = async () => {
+    if (!id) return
+    setBusy(true)
+    setActionError(null)
+    try {
+      const res = await api.retireDevice(id)
+      setNotice(res.detail)
+      setConfirming(null)
+      loadDevice()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : "that did not work")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async () => {
+    if (!id) return
+    setBusy(true)
+    setActionError(null)
+    try {
+      await api.deleteDevice(id)
+      navigate("/")
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : "that did not work")
+      setBusy(false)
+    }
+  }
 
   const loadTab = useCallback(() => {
     if (!id) return
@@ -399,7 +457,86 @@ export function DeviceDetailPage() {
         <span className="text-sm text-muted-foreground">
           {device.os_version || device.os_family} · {device.arch} · agent {device.agent_version}
         </span>
+        {me?.role === "admin" && (
+          <div className="ml-auto flex items-center gap-2">
+            {device.status !== "retired" && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={busy}
+                onClick={() => setConfirming(confirming === "retire" ? null : "retire")}
+              >
+                Retire device
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={busy}
+              onClick={() => setConfirming(confirming === "delete" ? null : "delete")}
+            >
+              <Trash2 className="size-4" />
+              Delete device
+            </Button>
+          </div>
+        )}
       </div>
+
+      {notice && <p className="text-sm text-muted-foreground">{notice}</p>}
+
+      {confirming === "retire" && (
+        <Card className="max-w-xl">
+          <CardContent className="flex flex-col gap-3 py-4">
+            <p className="text-sm">
+              Retiring revokes this agent's certificate, so the machine stops reporting to the
+              server. An already-connected agent keeps its session until its JWT expires, at most
+              a couple of minutes from now. It cannot reconnect or re-enroll without a fresh
+              enrollment token.
+            </p>
+            <div className="flex items-center gap-2">
+              <Button size="sm" disabled={busy} onClick={retire}>
+                Retire device
+              </Button>
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => setConfirming(null)}>
+                Cancel
+              </Button>
+            </div>
+            {actionError && (
+              <p className="flex items-start gap-2 text-sm text-destructive">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+                {actionError}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {confirming === "delete" && (
+        <Card className="max-w-xl">
+          <CardContent className="flex flex-col gap-3 py-4">
+            <p className="text-sm">
+              Deleting removes {device.hostname} and all of its history — telemetry, facts, script
+              runs, shell sessions — permanently. The device must be retired first, so its agent
+              credential is revoked before the records disappear.
+            </p>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="destructive" disabled={busy} onClick={remove}>
+                <Trash2 className="size-4" />
+                Delete forever
+              </Button>
+              <Button size="sm" variant="ghost" disabled={busy} onClick={() => setConfirming(null)}>
+                Cancel
+              </Button>
+            </div>
+            {actionError && (
+              <p className="flex items-start gap-2 text-sm text-destructive">
+                <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+                {actionError}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       <div className="flex flex-wrap gap-4">
         <StatTile icon={Cpu} label="CPU" value={device.cpu_pct} />
