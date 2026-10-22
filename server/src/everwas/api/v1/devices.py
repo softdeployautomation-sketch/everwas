@@ -75,6 +75,97 @@ async def _device_or_404(db, device_id: uuid.UUID, user) -> Device:
     return device
 
 
+TERMINAL_RUN_STATUSES = frozenset(
+    {RunStatus.succeeded, RunStatus.failed, RunStatus.timeout, RunStatus.cancelled}
+)
+
+
+@dataclass(frozen=True)
+class ApiActor:
+    """A caller resolved from either a console session or an API key.
+
+    `org_id` is the tenant boundary in both cases; a service call is scoped by
+    the key's org exactly like a browser session is scoped by the user's.
+    """
+
+    email: str
+    org_id: uuid.UUID | None
+    scopes: frozenset[str] = frozenset()
+    is_session: bool = False
+
+    def requires(self, scope: str) -> None:
+        if not self.is_session and scope not in self.scopes:
+            held = ", ".join(sorted(self.scopes)) or "none"
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"This token lacks the '{scope}' scope. Scopes on this token: {held}.",
+            )
+
+
+async def _resolve_actor(
+    db: DbSession,
+    everwas_session: str | None,
+    authorization: str | None,
+    roles: tuple[Role, ...],
+) -> ApiActor:
+    if everwas_session:
+        user = await resolve_session(db, everwas_session)
+        if user is None or not user.is_active:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session expired")
+        if user.role not in roles:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient role")
+        return ApiActor(email=user.email, org_id=user.org_id, is_session=True)
+
+    if authorization and authorization.lower().startswith("bearer "):
+        raw_key = authorization[len("bearer ") :].strip()
+        if raw_key.startswith(KEY_PREFIX):
+            principal = await authenticate_key(db, raw_key)
+            if principal is None:
+                raise HTTPException(
+                    status.HTTP_401_UNAUTHORIZED,
+                    "Invalid or expired API key.",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            return ApiActor(
+                email=principal.name,
+                org_id=principal.org_id,
+                scopes=frozenset(principal.scopes),
+            )
+
+    raise HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        "Not authenticated. Present an operator session cookie or an API key: "
+        "Authorization: Bearer ewpk_...",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def _command_actor(
+    db: DbSession,
+    everwas_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> ApiActor:
+    """Operator/admin session OR API key bearing `scripts:run`."""
+    return await _resolve_actor(
+        db, everwas_session, authorization, (Role.admin, Role.operator)
+    )
+
+
+async def _device_reader(
+    db: DbSession,
+    everwas_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> ApiActor:
+    """Any active session role (viewers read) OR an API key with `devices:read`.
+
+    Needed by Vantra: mapping a public agent id to its sw-* org goes through the
+    ONE device read, and a service has no browser session.
+    """
+    return await _resolve_actor(
+        db, everwas_session, authorization, (Role.admin, Role.operator, Role.viewer)
+    )
+
+
 @router.get("")
 async def list_devices(
     db: DbSession, _user: CurrentUser, include_retired: bool = False
@@ -261,8 +352,19 @@ async def set_network_identity(
 # as a malformed UUID, and the endpoint would 422 forever while looking
 # perfectly correct in the source.
 @router.get("/{device_id}")
-async def get_device(device_id: uuid.UUID, db: DbSession, _user: CurrentUser) -> DeviceDetailOut:
-    device = await _device_or_404(db, device_id, _user)
+async def get_device(
+    device_id: uuid.UUID, db: DbSession, actor: ApiActor = Depends(_device_reader)
+) -> DeviceDetailOut:
+    actor.requires("devices:read")
+    device = (
+        await db.execute(
+            scope_to_org(
+                select(Device).where(Device.id == device_id), Device.org_id, actor.org_id
+            )
+        )
+    ).scalar_one_or_none()
+    if device is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown device")
     latest = (
         await db.execute(
             select(DeviceStatusLatest).where(DeviceStatusLatest.device_id == device_id)
@@ -579,63 +681,7 @@ async def update_agent(
 # OR an API key bearer (`ewpk_...`) holding `scripts:run`. The key's org is the
 # tenant boundary; a session caller is scoped by its own org.
 
-TERMINAL_RUN_STATUSES = frozenset(
-    {RunStatus.succeeded, RunStatus.failed, RunStatus.timeout, RunStatus.cancelled}
-)
 
-
-@dataclass(frozen=True)
-class CommandActor:
-    email: str
-    org_id: uuid.UUID | None
-    scopes: frozenset[str] = frozenset()
-    is_session: bool = False
-
-    def requires(self, scope: str) -> None:
-        if not self.is_session and scope not in self.scopes:
-            held = ", ".join(sorted(self.scopes)) or "none"
-            raise HTTPException(
-                status.HTTP_403_FORBIDDEN,
-                f"This token lacks the '{scope}' scope. Scopes on this token: {held}.",
-            )
-
-
-async def _command_actor(
-    db: DbSession,
-    everwas_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
-    authorization: Annotated[str | None, Header()] = None,
-) -> CommandActor:
-    """Operator/admin session OR API key bearing `scripts:run`."""
-    if everwas_session:
-        user = await resolve_session(db, everwas_session)
-        if user is None or not user.is_active:
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session expired")
-        if user.role not in (Role.admin, Role.operator):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient role")
-        return CommandActor(email=user.email, org_id=user.org_id, is_session=True)
-
-    if authorization and authorization.lower().startswith("bearer "):
-        raw_key = authorization[len("bearer ") :].strip()
-        if raw_key.startswith(KEY_PREFIX):
-            principal = await authenticate_key(db, raw_key)
-            if principal is None:
-                raise HTTPException(
-                    status.HTTP_401_UNAUTHORIZED,
-                    "Invalid or expired API key.",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            return CommandActor(
-                email=principal.name,
-                org_id=principal.org_id,
-                scopes=frozenset(principal.scopes),
-            )
-
-    raise HTTPException(
-        status.HTTP_401_UNAUTHORIZED,
-        "Not authenticated. Present an operator session cookie or an API key: "
-        "Authorization: Bearer ewpk_...",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
 
 
 class CommandIn(BaseModel):
@@ -659,7 +705,7 @@ async def run_device_command(
     device_id: uuid.UUID,
     body: CommandIn,
     db: DbSession,
-    actor: CommandActor = Depends(_command_actor),
+    actor: ApiActor = Depends(_command_actor),
 ) -> CommandOut:
     """Run one command on one device and wait for its output.
 
