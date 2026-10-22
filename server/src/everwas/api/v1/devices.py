@@ -151,6 +151,19 @@ async def _command_actor(
     )
 
 
+async def _device_writer(
+    db: DbSession,
+    everwas_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> ApiActor:
+    """Admin session OR an API key with `devices:write` (retire/delete).
+
+    Same session roles as the ADMIN dependency these routes carried before, so
+    a console operator still cannot erase a device.
+    """
+    return await _resolve_actor(db, everwas_session, authorization, (Role.admin,))
+
+
 async def _device_reader(
     db: DbSession,
     everwas_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
@@ -487,8 +500,10 @@ async def get_snapshot(
     return {"payload": snap.payload, "updated_at": snap.updated_at.isoformat()}
 
 
-@router.post("/{device_id}/retire", dependencies=[ADMIN])
-async def retire(device_id: uuid.UUID, db: DbSession, user: CurrentUser) -> dict:
+@router.post("/{device_id}/retire")
+async def retire(
+    device_id: uuid.UUID, db: DbSession, actor: ApiActor = Depends(_device_writer)
+) -> dict:
     """Revoke an agent permanently.
 
     Admin-only and irreversible: the credential is deleted, so the machine
@@ -499,17 +514,26 @@ async def retire(device_id: uuid.UUID, db: DbSession, user: CurrentUser) -> dict
     keeps working until its JWT expires. Saying so is the difference between
     an operator who waits and one who assumes and moves on.
     """
+    actor.requires("devices:write")
     # Through the scoped gate first, so this route cannot be the one that
     # forgets. retire_device looks up by primary key alone, which is correct
     # for a service that trusts its caller; the caller is here.
-    await _device_or_404(db, device_id, user)
-    device = await retire_device(db, device_id, actor=user.email)
+    scoped = (
+        await db.execute(
+            scope_to_org(
+                select(Device).where(Device.id == device_id), Device.org_id, actor.org_id
+            )
+        )
+    ).scalar_one_or_none()
+    if scoped is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown device")
+    device = await retire_device(db, device_id, actor=actor.email)
     if device is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown device")
     await db.commit()
 
     ttl = get_settings().nats_jwt_ttl_s
-    log.info("device retired", device_id=str(device_id), actor=user.email)
+    log.info("device retired", device_id=str(device_id), actor=actor.email)
     return {
         "device_id": str(device_id),
         "status": device.status.value,
@@ -521,8 +545,10 @@ async def retire(device_id: uuid.UUID, db: DbSession, user: CurrentUser) -> dict
     }
 
 
-@router.delete("/{device_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[ADMIN])
-async def delete(device_id: uuid.UUID, db: DbSession, user: CurrentUser) -> None:
+@router.delete("/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete(
+    device_id: uuid.UUID, db: DbSession, actor: ApiActor = Depends(_device_writer)
+) -> None:
     """Remove a retired device and all of its history. Not reversible.
 
     Retiring is the first step and this is the second. Requiring both means a
@@ -530,9 +556,18 @@ async def delete(device_id: uuid.UUID, db: DbSession, user: CurrentUser) -> None
     between gives the agent's credential time to be revoked before its records
     disappear.
     """
-    await _device_or_404(db, device_id, user)
+    actor.requires("devices:write")
+    scoped = (
+        await db.execute(
+            scope_to_org(
+                select(Device).where(Device.id == device_id), Device.org_id, actor.org_id
+            )
+        )
+    ).scalar_one_or_none()
+    if scoped is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown device")
     try:
-        device = await delete_device(db, device_id, actor=user.email)
+        device = await delete_device(db, device_id, actor=actor.email)
     except DeviceNotRetiredError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     if device is None:
